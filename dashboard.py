@@ -1,194 +1,222 @@
-# dashboard.py - Streamlit Dashboard with Chatbot Q&A + Snowflake Integration
-
 import streamlit as st
-import pandas as pd
-import matplotlib.pyplot as plt
-import sys
-from affordability_model import (
-    load_historical_data, 
-    train_model, 
-    predict_safe_rent, 
-    recommend_apartments
-)
-import os
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+from audio_repeat import speak_text, clean_float, listen_and_transcribe
+from affordability_model import load_historical_data, train_model, load_sublets, recommend_apartments, predict_safe_rent
 
-from audio_repeat import listen_and_transcribe  # your audio recording module
-import snowflake.connector
+# -------------------------
+# Session state initialization
+# -------------------------
+if 'q_index' not in st.session_state:
+    st.session_state.q_index = 0
+if 'answers' not in st.session_state:
+    st.session_state.answers = {}
+if 'tone' not in st.session_state:
+    st.session_state.tone = 'neutral'
+if 'finished' not in st.session_state:
+    st.session_state.finished = False
+if 'tone_confirmed' not in st.session_state:
+    st.session_state.tone_confirmed = False
+if 'results_spoken' not in st.session_state:
+    st.session_state.results_spoken = False
+if 'fast_demo' not in st.session_state:
+    st.session_state.fast_demo = True
+if 'demo_mode' not in st.session_state:
+    st.session_state.demo_mode = True
+if 'spoken_raw' not in st.session_state:
+    st.session_state.spoken_raw = {}
+if 'spoken_value' not in st.session_state:
+    st.session_state.spoken_value = {}
 
-# ================= Page Configuration =================
-st.set_page_config(
-    page_title="Student Housing Recommendation",
-    page_icon="🏠",
-    layout="wide"
-)
+questions = [
+    "Enter your annual tuition fee:",
+    "Enter your current bank balance:",
+    "Enter your monthly part-time income:",
+    "Enter your monthly internship income:",
+    "Enter total received scholarships:",
+    "Enter total available loans:",
+    "Enter the number of months for which you need housing:"
+]
 
-# ================= Snowflake Integration =================
-def load_sublets_from_snowflake():
-    """
-    Connect to Snowflake and load apartment/sublet data dynamically.
-    Assumes credentials stored in Streamlit secrets.
-    """
-    conn = snowflake.connector.connect(
-        user=st.secrets["snowflake_user"],
-        password=st.secrets["snowflake_password"],
-        account=st.secrets["snowflake_account"],
-        warehouse=st.secrets["snowflake_warehouse"],
-        database=st.secrets["snowflake_database"],
-        schema=st.secrets["snowflake_schema"]
-    )
-    query = "SELECT * FROM sublets_table"
-    df = pd.read_sql(query, conn)
-    conn.close()
-    return df
-
-# ================= Model Initialization =================
-@st.cache_resource
-def initialize_model():
-    df_train = load_historical_data()
-    model = train_model(df_train)
-    return model
+st.title("🏠 Off-Campus Community Virtual Budget Assistant")
+st.checkbox("Fast demo mode (reduce latency)", key="fast_demo")
+st.checkbox("1-minute demo mode (auto-fill answers)", key="demo_mode")
 
 @st.cache_data
-def load_apartments_data():
-    return load_sublets_from_snowflake()
+def _load_historical_data():
+    return load_historical_data()
 
-# Load model and apartments
-model = initialize_model()
-apartments_df = load_apartments_data()
+@st.cache_resource
+def _load_model():
+    df_train = _load_historical_data()
+    return train_model(df_train)
 
-# ================= Chatbot Interaction =================
-st.title("🏠 Off-Campus Housing Recommendation Tool")
-st.markdown("""
-Welcome! I am your student housing assistant. Let's find the best affordable apartments for you.  
-Please answer the following questions.
-""")
+@st.cache_data
+def _load_sublets():
+    return load_sublets()
 
-def get_user_input():
-    """
-    Prompt user via chatbot (text + optional audio) to gather financial info.
-    """
-    # Use audio_record module if user wants audio input
-    use_audio = st.checkbox("Answer via voice", value=False)
-    
-    input_data = {}
-    
-    questions = [
-        ("tuition", "Enter your annual tuition fee ($)"),
-        ("bank_balance", "Enter your current bank balance ($)"),
-        ("part_time_income", "Enter your monthly part-time income ($)"),
-        ("internship_income", "Enter your monthly internship income ($)"),
-        ("scholarships", "Enter total scholarships received ($)"),
-        ("loans", "Enter total available loans ($)"),
-        ("months", "Enter the number of months for which you need housing")
-    ]
-    
-    for key, question in questions:
-        st.markdown(f"**{question}**")
-        if use_audio:
-            # Record audio and transcribe
-            value = listen_and_transcribe()
-            try:
-                # Convert numeric responses to float or int
-                if key == "months":
-                    value = int(value)
+# -------------------------
+# Step 1: Voice tone selection (3 buttons → go to 1st question)
+# -------------------------
+if not st.session_state.tone_confirmed:
+    st.subheader("Choose your preferred voice tone")
+    st.caption("Click a button to set the assistant's tone and start the questions.")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        if st.button("😊 Friendly", use_container_width=True):
+            st.session_state.tone = "friendly"
+            st.session_state.tone_confirmed = True
+            st.session_state.q_index = 1
+            speak_text(
+                "You selected friendly tone. Let's start with the first question.",
+                tone=st.session_state.tone,
+                async_playback=st.session_state.fast_demo
+            )
+    with col2:
+        if st.button("💼 Professional", use_container_width=True):
+            st.session_state.tone = "professional"
+            st.session_state.tone_confirmed = True
+            st.session_state.q_index = 1
+            speak_text(
+                "You selected professional tone. Let's start with the first question.",
+                tone=st.session_state.tone,
+                async_playback=st.session_state.fast_demo
+            )
+    with col3:
+        if st.button("😐 Neutral", use_container_width=True):
+            st.session_state.tone = "neutral"
+            st.session_state.tone_confirmed = True
+            st.session_state.q_index = 1
+            speak_text(
+                "You selected neutral tone. Let's start with the first question.",
+                tone=st.session_state.tone,
+                async_playback=st.session_state.fast_demo
+            )
+
+# Quick demo auto-fill
+
+if st.session_state.demo_mode and not st.session_state.finished:
+    if st.button("Auto-fill demo answers (finish now)", use_container_width=True):
+        st.session_state.answers = {
+            0: 12000.0,
+            1: 1500.0,
+            2: 800.0,
+            3: 1200.0,
+            4: 2000.0,
+            5: 3000.0,
+            6: 8.0
+        }
+        if not st.session_state.tone_confirmed:
+            st.session_state.tone = "neutral"
+            st.session_state.tone_confirmed = True
+        st.session_state.q_index = len(questions)
+        st.session_state.finished = True
+        st.session_state.results_spoken = False
+        st.rerun()
+# -------------------------
+# Step 2: Question display (voice reads question → Type or Speak → proceed)
+# -------------------------
+if st.session_state.tone_confirmed and not st.session_state.finished:
+    q_idx = st.session_state.q_index - 1
+    question = questions[q_idx]
+
+    st.subheader(f"Question {st.session_state.q_index} of {len(questions)}")
+    st.write(question)
+
+    # Speak the question once when entering this question (skip in demo mode)
+    if not st.session_state.demo_mode:
+        if 'spoken_q' not in st.session_state or st.session_state.spoken_q != q_idx:
+            speak_text(
+                question,
+                tone=st.session_state.tone,
+                async_playback=st.session_state.fast_demo
+            )
+            st.session_state.spoken_q = q_idx
+
+    # Input method: Type or Speak
+    answer_method = st.radio("Answer by:", options=["Type", "Speak"], key=f"method_{q_idx}", horizontal=True)
+
+    if answer_method == "Type":
+        typed_answer = st.text_input("Type your answer (e.g. 100 or one hundred) and press Enter:", key=f"type_{q_idx}", placeholder="Enter a number...")
+        if st.button("Submit Answer", key=f"submit_{q_idx}"):
+            if typed_answer is None or (isinstance(typed_answer, str) and not typed_answer.strip()):
+                st.warning("Please type your answer before submitting.")
+            else:
+                st.session_state.answers[q_idx] = clean_float(typed_answer)
+                if not st.session_state.fast_demo:
+                    speak_text(f"You entered {typed_answer}.", tone=st.session_state.tone)
+                if st.session_state.q_index < len(questions):
+                    st.session_state.q_index += 1
                 else:
-                    value = float(value)
-            except:
-                st.warning(f"Could not interpret your response: {value}. Please type it manually.")
-                value = st.number_input(question, min_value=0, step=100 if key != "months" else 1)
-        else:
-            value = st.number_input(question, min_value=0, step=100 if key != "months" else 1)
-        
-        input_data[key] = value
-    
-    return input_data
-
-user_input = get_user_input()
-
-# ================= Predict Safe Rent =================
-safe_rent = predict_safe_rent(model, user_input)
-
-# Filter apartments under safe rent
-recommended_apts = recommend_apartments(safe_rent, apartments_df)
-
-# ================= Display Metrics =================
-st.markdown("---")
-col_metric1, col_metric2, col_metric3 = st.columns(3)
-
-with col_metric1:
-    st.metric("AI-Predicted Safe Rent", f"${safe_rent:.2f}", delta="per month", delta_color="off")
-with col_metric2:
-    st.metric("Total Monthly Income", f"${user_input['part_time_income'] + user_input['internship_income']:.2f}")
-with col_metric3:
-    st.metric("Available Apartments", len(recommended_apts), delta="under budget", delta_color="off")
-
-# ================= Display Recommendations =================
-st.markdown("---")
-st.header("📋 Recommended Apartments")
-
-if len(recommended_apts) > 0:
-    display_df = recommended_apts.copy()
-    display_df['monthly_rent'] = display_df['monthly_rent'].apply(lambda x: f"${x:.2f}")
-    st.dataframe(display_df, use_container_width=True, height=400, hide_index=True)
-
-    # Bar chart visualization
-    st.subheader("🎯 Apartment Prices Comparison")
-    chart_data = recommended_apts.sort_values('monthly_rent')
-    
-    fig, ax = plt.subplots(figsize=(12, 6))
-    bars = ax.barh(chart_data['address'], chart_data['monthly_rent'], color='steelblue')
-    ax.axvline(x=safe_rent, color='red', linestyle='--', linewidth=2, label='Safe Rent Limit')
-    ax.set_xlabel('Monthly Rent ($)', fontsize=12, fontweight='bold')
-    ax.set_ylabel('Address', fontsize=12, fontweight='bold')
-    ax.set_title('Recommended Apartments - Monthly Rent', fontsize=14, fontweight='bold')
-    ax.legend()
-    ax.grid(axis='x', alpha=0.3)
-    ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'${x:.0f}'))
-    plt.tight_layout()
-    st.pyplot(fig)
-else:
-    st.warning(f"No apartments found under ${safe_rent:.2f}/month")
-    if len(apartments_df) > 0:
-        st.info(f"Available apartments range from ${apartments_df['monthly_rent'].min():.2f} to ${apartments_df['monthly_rent'].max():.2f}/month")
-
-# ================= Financial Summary =================
-st.markdown("---")
-st.subheader("📊 Your Financial Summary")
-
-col_summary1, col_summary2, col_summary3 = st.columns(3)
-
-with col_summary1:
-    st.write("**Income Sources:**")
-    st.write(f"- Part-Time: ${user_input['part_time_income']:.2f}")
-    st.write(f"- Internship: ${user_input['internship_income']:.2f}")
-    st.write(f"- **Total: ${user_input['part_time_income'] + user_input['internship_income']:.2f}**")
-
-with col_summary2:
-    st.write("**Financial Support:**")
-    st.write(f"- Scholarships: ${user_input['scholarships']:.2f}")
-    st.write(f"- Loans: ${user_input['loans']:.2f}")
-    st.write(f"- Bank Balance: ${user_input['bank_balance']:.2f}")
-
-with col_summary3:
-    st.write("**Rent Analysis:**")
-    st.write(f"- Safe Rent: ${safe_rent:.2f}")
-    if len(recommended_apts) > 0:
-        min_rent = recommended_apts['monthly_rent'].min()
-        max_rent = recommended_apts['monthly_rent'].max()
-        st.write(f"- Available Range: ${min_rent:.2f} - ${max_rent:.2f}")
+                    st.session_state.finished = True
+                st.rerun()
     else:
-        st.write("- No options available")
+        # Speak: record voice, convert words to number (e.g. "one hundred" → 100)
+        if st.session_state.get("speak_error"):
+            st.warning(st.session_state.speak_error)
+            st.session_state.speak_error = None
+        if st.button("🎤 Start Speaking", key=f"speak_btn_{q_idx}"):
+            with st.spinner("Listening... say your answer now."):
+                if not st.session_state.fast_demo:
+                    speak_text("Listening. Say your answer now.", tone=st.session_state.tone)
+                raw = listen_and_transcribe(duration=3 if st.session_state.fast_demo else 5)
+                if raw:
+                    numeric = clean_float(raw)
+                    st.session_state.spoken_raw[q_idx] = raw
+                    st.session_state.spoken_value[q_idx] = numeric
+                else:
+                    st.session_state.speak_error = "We didn't catch that. Please try again."
 
-# ================= Footer =================
-st.markdown("---")
-st.markdown("""
-**How It Works:**
-1. Answer the chatbot prompts (text or voice) to provide financial information
-2. The AI model predicts your safe monthly rent
-3. We show all apartments within your budget
-4. Compare prices and find the best option
+        if q_idx in st.session_state.get('spoken_raw', {}):
+            raw = st.session_state.spoken_raw[q_idx]
+            num = st.session_state.spoken_value[q_idx]
+            st.success(f"You said: **{raw}** → **{num}**")
+            if st.button("Submit Answer", key=f"submit_{q_idx}"):
+                st.session_state.answers[q_idx] = num
+                if not st.session_state.fast_demo:
+                    speak_text(f"You said {raw}.", tone=st.session_state.tone)
+                if st.session_state.q_index < len(questions):
+                    st.session_state.q_index += 1
+                else:
+                    st.session_state.finished = True
+                st.rerun()
 
-*Last Updated: February 2026*
-""")
+# -------------------------
+# Step 3: Visualization + budget + recommendations (read aloud)
+# -------------------------
+if st.session_state.finished:
+    user_input = {
+        'tuition': st.session_state.answers[0],
+        'bank_balance': st.session_state.answers[1],
+        'part_time_income': st.session_state.answers[2],
+        'internship_income': st.session_state.answers[3],
+        'scholarships': st.session_state.answers[4],
+        'loans': st.session_state.answers[5],
+        'months': int(st.session_state.answers[6])
+    }
 
+    model = _load_model()
+    safe_rent = predict_safe_rent(model, user_input)
+    sublets_df = _load_sublets()
+    recommendations = recommend_apartments(safe_rent, sublets_df)
+
+    st.subheader("Your budget & recommended housing")
+    st.metric("Suggested monthly rent budget", f"${safe_rent:,.2f}")
+
+    # Visualization: budget vs recommended apartments
+    if not recommendations.empty:
+        cols = list(recommendations.columns)
+        if 'address' in cols and 'monthly_rent' in cols:
+            chart_df = recommendations[['address', 'monthly_rent']].head(10)
+            chart_df = chart_df.rename(columns={'address': 'Address', 'monthly_rent': 'Rent ($)'})
+            st.bar_chart(chart_df.set_index('Address'))
+        st.write("**Recommended off-campus options within your budget:**")
+        st.dataframe(recommendations, use_container_width=True, hide_index=True)
+        addresses = ", ".join(recommendations["address"].tolist())
+        summary_text = f"Your suggested monthly rent budget is ${safe_rent:,.2f}. Recommended housing options within your budget are: {addresses}."
+    else:
+        st.info("No listings found within your budget. Try adjusting your inputs or check back later.")
+        summary_text = f"Your suggested monthly rent budget is ${safe_rent:,.2f}. No suitable housing options were found within your budget."
+
+    # Read results aloud once
+    if not st.session_state.results_spoken:
+        speak_text(summary_text, tone=st.session_state.tone, async_playback=st.session_state.fast_demo)
+        st.session_state.results_spoken = True

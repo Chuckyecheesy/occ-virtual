@@ -1,48 +1,44 @@
-import pandas as pd
 import os
-from gtts import gTTS
-from speech_recognition import Recognizer, Microphone, AudioData
-from elevenlabs.client import ElevenLabs
-from elevenlabs.play import play
-import sounddevice as sd
+import tempfile
+import threading
+import subprocess
+from functools import lru_cache
+
 import numpy as np
+import sounddevice as sd
+from dotenv import load_dotenv
+from gtts import gTTS
+from speech_recognition import Recognizer, AudioData
 from word2number import w2n
+from elevenlabs.client import ElevenLabs
+
 from affordability_model import (
-    load_historical_data, 
-    train_model, 
-    load_sublets, 
-    recommend_apartments
+    load_historical_data,
+    train_model,
+    load_sublets,
+    recommend_apartments,
+    predict_safe_rent
 )
 
+load_dotenv()  # ✅ Must be first before accessing os.getenv
+
 # -------------------------
-# ElevenLabs Setup
+# ElevenLabs Setup (lazy to reduce latency on import)
 # -------------------------
-ELEVENLABS_API_KEY = "sk_282178210d030b5f4510ef76647e9620e4536efef1fea724"
-# Initialize client
-client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
-
-all_voices = client.voices.get_all()
-
-for v in all_voices:
-    print(v)
-
-
-# Hardcoded voice IDs for Rachel and Sean
-# You can find these in your ElevenLabs Dashboard or via client.voices.get_all()
-voices = {
-    "friendly": "CwhRBWXzGAHq8TQ4Fs17",      # Roger
-    "professional": "EXAVITQu4vr4xnSDxMaL"    # Sarah
+_VOICE_IDS = {
+    "friendly": os.getenv("VOICE_FRIENDLY"),
+    "professional": os.getenv("VOICE_PROFESSIONAL")
 }
 
-# Verification check
-if not voices["friendly"]:
-    print("Friendly voice ID missing!")
+@lru_cache(maxsize=1)
+def _get_elevenlabs_client():
+    api_key = os.getenv("ELEVENLABS_API_KEY")
+    if not api_key:
+        return None
+    return ElevenLabs(api_key=api_key)
 
-# Step 4: Check if voices were found
-if not "friendly":
-    print("Friendly voice 'Rachel' not found!")
-if not "professional":
-    print("Professional voice 'Sean' not found!")
+def _get_voice_id(tone: str):
+    return _VOICE_IDS.get(tone)
 
 # -------------------------
 # Speech Recognition Setup
@@ -78,43 +74,66 @@ def listen_and_transcribe(duration=5, fs=44100):
 # -------------------------
 # Text-to-Speech Function
 # -------------------------
-def speak_text(text, tone="neutral"):
-    """Speak text using selected tone: friendly, professional, or neutral."""
-    if tone in ["friendly", "professional"]:
-        # Get the ID string from your voices dictionary
-        voice_id = voices[tone]
-        
-        # Correct SDK call: Use the client's text_to_speech.convert method
-        audio_generator = client.text_to_speech.convert(
-            text=text,
-            voice_id=voice_id,
-            model_id="eleven_multilingual_v2", # Standard high-quality model
-            output_format="mp3_44100_128"      # Optional: set quality
-        )
-        
-        # client.text_to_speech.convert returns a generator; join chunks into bytes
-        audio_bytes = b"".join(audio_generator)
-        
-        with open("temp.mp3", "wb") as f:
-            f.write(audio_bytes)
-        
-        # Play the file using Mac's afplay
-        os.system("afplay temp.mp3")
-        os.remove("temp.mp3")
+def _cleanup_audio_file(path, process, async_playback):
+    if async_playback:
+        def _wait_and_cleanup():
+            process.wait()
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        threading.Thread(target=_wait_and_cleanup, daemon=True).start()
     else:
-        # Neutral uses Google TTS (gTTS)
-        tts = gTTS(text=text, lang="en")
-        filename = "temp.mp3"
-        tts.save(filename)
-        os.system(f"afplay {filename}")
-        os.remove(filename)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+def _play_audio_file(path, async_playback=False):
+    if async_playback:
+        process = subprocess.Popen(["afplay", path])
+        return process
+    subprocess.run(["afplay", path], check=False)
+    return None
+
+def speak_text(text, tone="neutral", async_playback=False):
+    try:
+        # Use ElevenLabs TTS if friendly/professional and API key present
+        voice_id = _get_voice_id(tone)
+        client = _get_elevenlabs_client()
+        if tone in ["friendly", "professional"] and voice_id and client:
+            audio_generator = client.text_to_speech.convert(
+                text=text,
+                voice_id=voice_id,
+                model_id="eleven_multilingual_v2",
+                output_format="mp3_44100_128"
+            )
+            audio_bytes = b"".join(audio_generator)
+            # Use tempfile for safety
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as f:
+                f.write(audio_bytes)
+                tmp_file = f.name
+            process = _play_audio_file(tmp_file, async_playback=async_playback)
+            _cleanup_audio_file(tmp_file, process, async_playback=async_playback)
+        else:
+            # Neutral fallback TTS
+            tts = gTTS(text=text, lang="en")
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as f:
+                tts.save(f.name)
+                tmp_file = f.name
+            process = _play_audio_file(tmp_file, async_playback=async_playback)
+            _cleanup_audio_file(tmp_file, process, async_playback=async_playback)
+    except Exception as e:
+        print(f"[TTS failed] {e}")
+        print(text)
+
+
 # -------------------------
 # Ask Question Helper
 # -------------------------
 def ask_question(prompt, tone="neutral"):
-    """
-    Ask a question via TTS and get answer via voice or text input.
-    """
+    """Ask a question via TTS and return text answer"""
+    print(prompt)
     speak_text(prompt + " You can speak or type your answer.", tone=tone)
     choice = input(f"{prompt} (type 'speak' to answer by voice, anything else to type): ").strip().lower()
     if choice == "speak":
@@ -135,11 +154,11 @@ def clean_float(val):
 
     try:
         # text2num handles "1 million", "8", and "eight" natively
-        return float(text2num(val, lang="en"))
+        return float(val)
     except ValueError:
         # Fallback for standard float parsing
         try:
-            return float(val)
+            return float(w2n.word_to_num(val))
         except ValueError:
             print(f"⚠️ Could not parse '{val}', defaulting to 0.0")
             return 0.0
@@ -171,14 +190,7 @@ def gather_user_input(tone="neutral"):
     }
 
 
-# -------------------------
-# Predict Safe Rent
-# -------------------------
-def predict_safe_rent(model, user_input):
-    """Convert user input into DataFrame and predict safe rent."""
-    input_df = pd.DataFrame([user_input])
-    safe_rent = model.predict(input_df)[0]
-    return safe_rent
+
 
 # -------------------------
 # Main Process
