@@ -2,7 +2,9 @@ import os
 import tempfile
 import threading
 import subprocess
+from collections import deque
 from functools import lru_cache
+import json
 
 import numpy as np
 import sounddevice as sd
@@ -25,9 +27,19 @@ load_dotenv()  # ✅ Must be first before accessing os.getenv
 # -------------------------
 # ElevenLabs Setup (lazy to reduce latency on import)
 # -------------------------
+def _parse_voice_list(env_key, fallback_key=None):
+    raw = os.getenv(env_key, "")
+    if raw:
+        return [v.strip() for v in raw.split(",") if v.strip()]
+    if fallback_key:
+        fallback = os.getenv(fallback_key)
+        return [fallback] if fallback else []
+    return []
+
 _VOICE_IDS = {
-    "friendly": os.getenv("VOICE_FRIENDLY"),
-    "professional": os.getenv("VOICE_PROFESSIONAL")
+    "friendly": _parse_voice_list("VOICE_FRIENDLY_IDS", "VOICE_FRIENDLY"),
+    "professional": _parse_voice_list("VOICE_PROFESSIONAL_IDS", "VOICE_PROFESSIONAL"),
+    "neutral": _parse_voice_list("VOICE_NEUTRAL_IDS")
 }
 
 @lru_cache(maxsize=1)
@@ -38,12 +50,25 @@ def _get_elevenlabs_client():
     return ElevenLabs(api_key=api_key)
 
 def _get_voice_id(tone: str):
-    return _VOICE_IDS.get(tone)
+    voice_list = _VOICE_IDS.get(tone, [])
+    if not voice_list:
+        return None
+    return voice_list[0]
 
 # -------------------------
 # Speech Recognition Setup
 # -------------------------
 recognizer = Recognizer()
+
+try:
+    import google.generativeai as genai
+except ImportError:
+    genai = None
+
+try:
+    import requests
+except ImportError:
+    requests = None
 
 def listen_and_transcribe(duration=5, fs=44100):
     """
@@ -74,15 +99,42 @@ def listen_and_transcribe(duration=5, fs=44100):
 # -------------------------
 # Text-to-Speech Function
 # -------------------------
-def _cleanup_audio_file(path, process, async_playback):
-    if async_playback:
-        def _wait_and_cleanup():
-            process.wait()
+_AUDIO_QUEUE = deque()
+_AUDIO_QUEUE_LOCK = threading.Lock()
+_AUDIO_QUEUE_EVENT = threading.Event()
+_AUDIO_THREAD = None
+
+def _audio_worker():
+    while True:
+        _AUDIO_QUEUE_EVENT.wait()
+        while True:
+            with _AUDIO_QUEUE_LOCK:
+                if not _AUDIO_QUEUE:
+                    _AUDIO_QUEUE_EVENT.clear()
+                    break
+                path = _AUDIO_QUEUE.popleft()
+            _play_audio_file(path, async_playback=False)
             try:
                 os.remove(path)
             except OSError:
                 pass
-        threading.Thread(target=_wait_and_cleanup, daemon=True).start()
+
+def _ensure_audio_worker():
+    global _AUDIO_THREAD
+    if _AUDIO_THREAD and _AUDIO_THREAD.is_alive():
+        return
+    _AUDIO_THREAD = threading.Thread(target=_audio_worker, daemon=True)
+    _AUDIO_THREAD.start()
+
+def _enqueue_audio(path):
+    _ensure_audio_worker()
+    with _AUDIO_QUEUE_LOCK:
+        _AUDIO_QUEUE.append(path)
+        _AUDIO_QUEUE_EVENT.set()
+
+def _cleanup_audio_file(path, process, async_playback):
+    if async_playback:
+        _enqueue_audio(path)
     else:
         try:
             os.remove(path)
@@ -96,33 +148,45 @@ def _play_audio_file(path, async_playback=False):
     subprocess.run(["afplay", path], check=False)
     return None
 
-def speak_text(text, tone="neutral", async_playback=False):
-    try:
-        # Use ElevenLabs TTS if friendly/professional and API key present
-        voice_id = _get_voice_id(tone)
-        client = _get_elevenlabs_client()
-        if tone in ["friendly", "professional"] and voice_id and client:
-            audio_generator = client.text_to_speech.convert(
-                text=text,
-                voice_id=voice_id,
-                model_id="eleven_multilingual_v2",
-                output_format="mp3_44100_128"
-            )
-            audio_bytes = b"".join(audio_generator)
-            # Use tempfile for safety
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as f:
-                f.write(audio_bytes)
-                tmp_file = f.name
-            process = _play_audio_file(tmp_file, async_playback=async_playback)
-            _cleanup_audio_file(tmp_file, process, async_playback=async_playback)
+def speak_text(text, tone="neutral", async_playback=False, voice_id=None):
+    # Always fall back to gTTS if ElevenLabs fails.
+    def _play_gtts():
+        tts = gTTS(text=text, lang="en")
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as f:
+            tts.save(f.name)
+            tmp_file = f.name
+        if async_playback:
+            _cleanup_audio_file(tmp_file, None, async_playback=True)
         else:
-            # Neutral fallback TTS
-            tts = gTTS(text=text, lang="en")
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as f:
-                tts.save(f.name)
-                tmp_file = f.name
-            process = _play_audio_file(tmp_file, async_playback=async_playback)
-            _cleanup_audio_file(tmp_file, process, async_playback=async_playback)
+            process = _play_audio_file(tmp_file, async_playback=False)
+            _cleanup_audio_file(tmp_file, process, async_playback=False)
+
+    try:
+        if voice_id is None:
+            voice_id = _get_voice_id(tone)
+        client = _get_elevenlabs_client()
+        if tone in ["friendly", "professional", "neutral"] and voice_id and client:
+            try:
+                audio_generator = client.text_to_speech.convert(
+                    text=text,
+                    voice_id=voice_id,
+                    model_id="eleven_multilingual_v2",
+                    output_format="mp3_44100_128"
+                )
+                audio_bytes = b"".join(audio_generator)
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as f:
+                    f.write(audio_bytes)
+                    tmp_file = f.name
+                if async_playback:
+                    _cleanup_audio_file(tmp_file, None, async_playback=True)
+                else:
+                    process = _play_audio_file(tmp_file, async_playback=False)
+                    _cleanup_audio_file(tmp_file, process, async_playback=False)
+            except Exception as e:
+                print(f"[ElevenLabs TTS failed] {e}")
+                _play_gtts()
+        else:
+            _play_gtts()
     except Exception as e:
         print(f"[TTS failed] {e}")
         print(text)
@@ -153,15 +217,89 @@ def clean_float(val):
         return 0.0
 
     try:
-        # text2num handles "1 million", "8", and "eight" natively
         return float(val)
     except ValueError:
-        # Fallback for standard float parsing
         try:
             return float(w2n.word_to_num(val))
         except ValueError:
+            gemini_val = _gemini_parse_number(val)
+            if gemini_val is not None:
+                return gemini_val
             print(f"⚠️ Could not parse '{val}', defaulting to 0.0")
             return 0.0
+
+@lru_cache(maxsize=1)
+def _get_gemini_model():
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key or genai is None:
+        return None
+    genai.configure(api_key=api_key)
+    return genai.GenerativeModel("gemini-1.5-flash")
+
+def _gemini_parse_number(text):
+    """
+    Use Gemini to parse spoken-number text into a numeric value.
+    Returns float or None when unavailable.
+    """
+    model = _get_gemini_model()
+    if model is None:
+        return None
+    prompt = (
+        "Convert the following spoken number into a numeric value. "
+        "Return only the number with no extra text.\n"
+        f"Input: {text}"
+    )
+    try:
+        result = model.generate_content(prompt)
+        raw = (result.text or "").strip()
+        return float(raw)
+    except Exception:
+        return None
+
+def openrouter_clarify_number(text):
+    """
+    Use OpenRouter to clarify spoken input into a numeric value.
+    Returns dict: {"normalized": str|None, "number": float|None, "confidence": float|None}
+    """
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    if not api_key or requests is None:
+        return None
+
+    model = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
+    system_prompt = (
+        "You convert spoken financial inputs to numeric values. "
+        "Return ONLY valid JSON with keys: normalized, number, confidence."
+    )
+    user_prompt = f"Input: {text}"
+    try:
+        resp = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "http://localhost",
+                "X-Title": "OCCVirtual"
+            },
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                "temperature": 0.0
+            },
+            timeout=15
+        )
+        resp.raise_for_status()
+        content = resp.json()["choices"][0]["message"]["content"].strip()
+        data = json.loads(content)
+        return {
+            "normalized": data.get("normalized"),
+            "number": data.get("number"),
+            "confidence": data.get("confidence")
+        }
+    except Exception:
+        return None
 
 def gather_user_input(tone="neutral"):
     """Gather financial and housing info from the user."""
